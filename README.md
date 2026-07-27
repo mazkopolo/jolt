@@ -8,3 +8,4 @@ Jolt collects no data. The policy says so, and says what the app stores on your 
 device instead.
 
 Contact: mazkopolo@icloud.com
+
