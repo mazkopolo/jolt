@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jolt — Cast Receiver</title>
+
+<!--
+  Jolt's Chromecast receiver.
+
+  The phone does not mirror its screen; it sends a small JSON frame about once a second and
+  this page draws the clock itself. Sharper on a TV, far lower latency, and the phone is
+  free to go in a pocket.
+
+  Host at a stable HTTPS URL, register it as a **Custom Receiver** in the Google Cast
+  Developer Console, and put the resulting application ID into the app's
+  res/values/cast.xml.
+
+  ## Write for an OLD browser
+
+  Chromecast firmware moves slowly: a 3.72 dongle runs a Chrome from around 2019. Anything
+  newer than that is unavailable, and a single unsupported declaration can take the whole
+  page down with it. Deliberately avoided here:
+
+    color-mix()        Chrome 111 — the phase wash is plain rgba(), computed in JS
+    inset: 0           Chrome 87  — written out as top/right/bottom/left
+    flexbox gap        Chrome 84  — margins instead
+    :is() / :where()   Chrome 88
+
+  Sizing is in `vmin` throughout so it fills a 1080p TV and a 4K one identically.
+-->
+
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+<style>
+  :root {
+    --bg: #0A0E14;
+    --text: #F3F6FB;
+    --dim: #98A2B3;
+    --volt: #B6FF3A;
+    --phase: #B6FF3A;
+  }
+  @font-face {
+    font-family: 'Saira Condensed';
+    src: url('SairaCondensed-Black.ttf') format('truetype');
+    font-weight: 900;
+    font-display: swap;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: #0A0E14;
+    color: #F3F6FB;
+    font-family: 'Saira Condensed', 'Arial Narrow', Arial, sans-serif;
+    /* TVs overscan. Nothing important goes in the outer 5%. */
+    padding: 5vmin;
+  }
+
+  /* The phase wash. A plain rgba set from JS — see the note about color-mix above. */
+  #stage {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    background: rgba(182, 255, 58, 0.18);
+    transition: background 400ms ease;
+  }
+  #content {
+    position: relative;
+    width: 100%; height: 100%;
+    display: flex; flex-direction: column;
+  }
+
+  #phase {
+    color: #B6FF3A;
+    font-size: 7vmin; font-weight: 900;
+    letter-spacing: 0.8vmin; text-align: center;
+    text-transform: uppercase;
+  }
+
+  #middle { flex: 1 1 auto; display: flex; align-items: center; min-height: 0; }
+  #clock {
+    font-size: 34vmin; font-weight: 900; line-height: 0.84;
+    white-space: nowrap;
+    margin-right: 4vmin;
+  }
+
+  #moves { flex: 1 1 auto; min-width: 0; }
+  .move {
+    font-size: 6vmin; font-weight: 900; line-height: 1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-bottom: 1.4vmin;
+  }
+  .move b { color: #B6FF3A; margin-right: 1.2vmin; }
+  #nextup { color: #98A2B3; font-size: 2.6vmin; letter-spacing: 0.5vmin;
+            margin-bottom: 1vmin; }
+
+  #stats { text-align: center; }
+  .stat { display: inline-block; margin: 0 3.5vmin; text-align: center; }
+  .stat .v { font-size: 6vmin; font-weight: 900; }
+  .stat .l { font-size: 1.8vmin; color: #98A2B3; letter-spacing: 0.4vmin; }
+
+  /* Idle and finished, so the TV is never just a blank rectangle — and so a receiver that
+     loaded but is receiving nothing looks different from one that failed to load. */
+  #idle {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    background: #0A0E14;
+    text-align: center;
+    padding-top: 30vmin;
+  }
+  #idle h1 { font-size: 12vmin; font-weight: 900; letter-spacing: 1vmin; color: #B6FF3A; }
+  #idle p { font-size: 3vmin; color: #98A2B3; font-family: Arial, sans-serif;
+            margin-top: 2vmin; }
+  .hide { display: none; }
+</style>
+</head>
+
+<body>
+  <div id="stage"></div>
+
+  <div id="content" class="hide">
+    <div id="phase">WORK</div>
+    <div id="middle">
+      <div id="clock">0:00</div>
+      <div id="moves"><div id="nextup" class="hide">NEXT UP</div></div>
+    </div>
+    <div id="stats"></div>
+  </div>
+
+  <div id="idle">
+    <h1>JOLT</h1>
+    <p id="idleText">Connected — start a workout on your phone</p>
+  </div>
+
+<script>
+  // Phase colours as raw components, so the wash can be built without color-mix().
+  var PHASE = {
+    prep:      [41, 211, 255],
+    work:      [182, 255, 58],
+    rest:      [255, 158, 27],
+    maxeffort: [255, 77, 141]
+  };
+
+  function $(id) { return document.getElementById(id); }
+  function show(el, on) { el.className = on ? '' : 'hide'; }
+
+  function render(d) {
+    show($('idle'), false);
+    show($('content'), true);
+
+    var phase = String(d.phase || 'work').toLowerCase();
+    var c = PHASE[phase] || PHASE.work;
+    var rgb = 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+    $('stage').style.background = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.18)';
+    $('phase').style.color = rgb;
+
+    $('phase').innerHTML = d.phaseTitle || '';
+    $('clock').innerHTML = d.clock || '0:00';
+    // Rest prints the clock in amber: the colour is the phase signal.
+    $('clock').style.color = (phase === 'rest') ? rgb : '#F3F6FB';
+
+    // A rest shows the *coming* round, so say so — otherwise it reads as instructions
+    // for the rest itself.
+    var isRest = (phase === 'rest');
+    show($('nextup'), isRest);
+
+    var moves = d.movements || [];
+    var holder = $('moves');
+    var old = holder.getElementsByClassName('move');
+    while (old.length) { holder.removeChild(old[0]); }
+    for (var i = 0; i < moves.length; i++) {
+      var row = document.createElement('div');
+      row.className = 'move';
+      row.innerHTML = (moves[i].reps ? '<b style="color:' + rgb + '">' + moves[i].reps + '</b>' : '') +
+                      String(moves[i].name).toUpperCase();
+      holder.appendChild(row);
+    }
+
+    // With no movements the clock takes the whole width rather than sitting off-centre.
+    var bare = !moves.length && !isRest;
+    show(holder, !bare);
+    $('clock').style.flex = bare ? '1 1 auto' : '0 0 auto';
+    $('clock').style.textAlign = bare ? 'center' : 'left';
+    $('clock').style.marginRight = bare ? '0' : '4vmin';
+
+    var stats = [];
+    if (d.round && d.totalRounds) stats.push(['ROUND', d.round + '/' + d.totalRounds]);
+    if (d.reps) stats.push(['REPS', d.reps]);
+    if (d.elapsed) stats.push(['ELAPSED', d.elapsed]);
+    if (d.remaining) stats.push(['LEFT', d.remaining]);
+    var html = '';
+    for (var j = 0; j < stats.length; j++) {
+      html += '<div class="stat"><div class="v">' + stats[j][1] + '</div>' +
+              '<div class="l">' + stats[j][0] + '</div></div>';
+    }
+    $('stats').innerHTML = html;
+  }
+
+  function finished(d) {
+    show($('content'), false);
+    show($('idle'), true);
+    $('idleText').innerHTML = (d.name ? d.name + ' — ' : '') + 'great work.';
+  }
+
+  try {
+    var ctx = cast.framework.CastReceiverContext.getInstance();
+    ctx.addCustomMessageListener('urn:x-cast:com.joltapp.jolt', function (event) {
+      var d = event.data;
+      if (typeof d === 'string') { d = JSON.parse(d); }
+      if (!d) return;
+      if (d.type === 'finished') { finished(d); } else { render(d); }
+    });
+
+    // A gym timer must not vanish because nobody touched anything for five minutes.
+    var opts = new cast.framework.CastReceiverOptions();
+    opts.disableIdleTimeout = true;
+    opts.maxInactivity = 3600;
+    ctx.start(opts);
+  } catch (e) {
+    // Loaded outside a Cast device (a browser, for testing). The page still renders.
+    $('idleText').innerHTML = 'Receiver loaded — no Cast session (' + e.message + ')';
+  }
+</script>
+</body>
+</html>
