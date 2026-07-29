@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jolt — Cast Receiver</title>
+
+<!--
+  Jolt's Chromecast receiver.
+
+  The phone does not mirror its screen; it sends a small JSON frame about once a second and
+  this page draws the clock itself. Sharper on a TV, far lower latency, and the phone is
+  free to go in a pocket.
+
+  Host at a stable HTTPS URL, register it as a **Custom Receiver** in the Google Cast
+  Developer Console, and put the resulting application ID into the app's
+  res/values/cast.xml.
+
+  ## Write for an OLD browser
+
+  Chromecast firmware moves slowly: a 3.72 dongle runs a Chrome from around 2019. Anything
+  newer than that is unavailable, and a single unsupported declaration can take the whole
+  page down with it. Deliberately avoided here:
+
+    color-mix()        Chrome 111 — the phase wash is plain rgba(), computed in JS
+    inset: 0           Chrome 87  — written out as top/right/bottom/left
+    flexbox gap        Chrome 84  — margins instead
+    :is() / :where()   Chrome 88
+
+  Sizing is in `vmin` throughout so it fills a 1080p TV and a 4K one identically.
+-->
+
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+<style>
+  :root {
+    --bg: #0A0E14;
+    --text: #F3F6FB;
+    --dim: #98A2B3;
+    --volt: #B6FF3A;
+    --phase: #B6FF3A;
+  }
+  @font-face {
+    font-family: 'Saira Condensed';
+    src: url('SairaCondensed-Black.ttf') format('truetype');
+    font-weight: 900;
+    font-display: swap;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #0A0E14; }
+  body {
+    background: #0A0E14;
+    color: #F3F6FB;
+    font-family: 'Saira Condensed', 'Arial Narrow', Arial, sans-serif;
+    /* TVs overscan. Nothing important goes in the outer 5%. */
+    padding: 5vmin;
+  }
+
+  /*
+    The phase wash, as an **opaque** colour blended in JS.
+    It was rgba() over the page background, which assumed the thing behind us was our own
+    dark body. On a real Chromecast it wasn't, and 18% lime over white rendered as pale
+    sage — the whole screen washed out. Never rely on what is underneath.
+  */
+  #stage {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    background: rgb(41, 57, 27);
+    transition: background 400ms ease;
+  }
+  #content {
+    position: relative;
+    width: 100%; height: 100%;
+    display: flex; flex-direction: column;
+  }
+
+  #phase {
+    color: #B6FF3A;
+    font-size: 7vmin; font-weight: 900;
+    letter-spacing: 0.8vmin; text-align: center;
+    text-transform: uppercase;
+  }
+
+  #middle { flex: 1 1 auto; display: flex; align-items: center; min-height: 0; }
+
+  /* The signature ring, the one thing people recognise across a gym. SVG rather than
+     conic-gradient or canvas: dash-offset arcs work on every browser a Chromecast has
+     ever shipped, and cost nothing to animate. */
+  #dial { position: relative; width: 44vmin; height: 44vmin; flex: 0 0 auto;
+          margin-right: 4vmin; }
+  #dial svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  #track { fill: none; stroke: rgba(255,255,255,0.07); stroke-width: 7; }
+  #arc {
+    fill: none; stroke: #B6FF3A; stroke-width: 7; stroke-linecap: round;
+    stroke-dasharray: 276.5; stroke-dashoffset: 276.5;
+    transition: stroke-dashoffset 300ms linear;
+  }
+  #clock {
+    position: absolute; top: 0; right: 0; bottom: 0; left: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15vmin; font-weight: 900; line-height: 1;
+    white-space: nowrap;
+  }
+  /* No movements: the ring takes the middle on its own. */
+  #middle.bare #dial { margin: 0 auto; width: 52vmin; height: 52vmin; }
+  #middle.bare #clock { font-size: 18vmin; }
+
+  /* The whole workout, block by block. The TV has room for what is coming; the phone
+     does not, which is the main thing a big screen buys you. */
+  #plan { text-align: center; margin-bottom: 2vmin; }
+  .blk {
+    display: inline-block; margin: 0 1vmin;
+    padding: 0.8vmin 1.8vmin; border-radius: 1.4vmin;
+    background: rgba(255,255,255,0.05); color: #98A2B3;
+    /* Read from across a room, so bigger than it looks on a monitor. Two lines rather
+       than one clipped line — the point of the strip is what the block *is*. */
+    font-size: 2.6vmin; max-width: 40vmin; line-height: 1.25;
+    white-space: normal; overflow: hidden;
+    vertical-align: top;
+  }
+  .blk.on { background: rgba(255,255,255,0.14); color: #F3F6FB; }
+  .blk .r { font-weight: 900; margin-right: 0.8vmin; }
+
+  /* `overflow: hidden` is the backstop; `min-height: 0` is what actually lets a flex
+     child shrink instead of pushing its siblings off screen. */
+  #moves { flex: 1 1 auto; min-width: 0; min-height: 0; max-height: 100%; overflow: hidden; }
+  .move {
+    font-size: 6vmin; font-weight: 900; line-height: 1.05;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-bottom: 1.4vmin;
+  }
+  .move b { color: #B6FF3A; margin-right: 1.2vmin; }
+  #nextup { color: #98A2B3; font-size: 2.6vmin; letter-spacing: 0.5vmin;
+            margin-bottom: 1vmin; }
+
+  #stats { text-align: center; }
+  .stat { display: inline-block; margin: 0 3.5vmin; text-align: center; }
+  .stat .v { font-size: 6vmin; font-weight: 900; }
+  .stat .l { font-size: 1.8vmin; color: #98A2B3; letter-spacing: 0.4vmin; }
+
+  /* Idle and finished, so the TV is never just a blank rectangle — and so a receiver that
+     loaded but is receiving nothing looks different from one that failed to load. */
+  #idle {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    background: #0A0E14;
+    text-align: center;
+    padding-top: 30vmin;
+  }
+  #idle h1 { font-size: 12vmin; font-weight: 900; letter-spacing: 1vmin; color: #B6FF3A; }
+  #idle p { font-size: 3vmin; color: #98A2B3; font-family: Arial, sans-serif;
+            margin-top: 2vmin; }
+  .hide { display: none; }
+</style>
+</head>
+
+<body>
+  <div id="stage"></div>
+
+  <div id="content" class="hide">
+    <div id="phase">WORK</div>
+    <div id="middle">
+      <div id="dial">
+        <svg viewBox="0 0 100 100">
+          <circle id="track" cx="50" cy="50" r="44"></circle>
+          <circle id="arc" cx="50" cy="50" r="44"></circle>
+        </svg>
+        <div id="clock">0:00</div>
+      </div>
+      <div id="moves"><div id="nextup" class="hide">NEXT UP</div></div>
+    </div>
+    <div id="plan"></div>
+    <div id="stats"></div>
+  </div>
+
+  <div id="idle">
+    <h1>JOLT</h1>
+    <p id="idleText">Connected — start a workout on your phone</p>
+  </div>
+
+<script>
+  // Phase colours as raw components, so the wash can be built without color-mix().
+  var PHASE = {
+    prep:      [41, 211, 255],
+    work:      [182, 255, 58],
+    rest:      [255, 158, 27],
+    maxeffort: [255, 77, 141]
+  };
+
+  function $(id) { return document.getElementById(id); }
+
+  // ---- Voice -------------------------------------------------------------------------
+  //
+  // The phone goes silent while casting and sends clip URLs instead, so the coach comes out
+  // of the TV. Gapless *within* a line, 750 ms *between* lines — the same rule the phone
+  // uses, and the reason "Round three." and "Eight reps." don't run together.
+
+  var PHRASE_GAP_MS = 750;
+  var speaking = [];        // queue of remaining lines, each an array of clip URLs
+  var current = null;       // the Audio element in flight
+  var gapTimer = null;
+  var warmed = false;
+
+  function stopSpeaking() {
+    if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
+    if (current) {
+      try { current.pause(); } catch (e) {}
+      current = null;
+    }
+    speaking = [];
+  }
+
+  function playClips(urls, done) {
+    if (!urls.length) { done(); return; }
+    var a = new Audio(urls[0]);
+    current = a;
+    // A clip that 404s or fails to decode must not stall the queue — but `onerror` and a
+    // rejected `play()` can both fire for the same clip, and advancing twice silently eats
+    // the next word of the sentence. Advance once, whichever arrives first.
+    var advanced = false;
+    function next() {
+      if (advanced) return;
+      advanced = true;
+      playClips(urls.slice(1), done);
+    }
+    a.onended = next;
+    a.onerror = next;
+    var p = a.play();
+    if (p && p.catch) { p.catch(next); }
+  }
+
+  function pump() {
+    if (!speaking.length) { current = null; return; }
+    var line = speaking.shift();
+    playClips(line, function () {
+      if (!speaking.length) { current = null; return; }
+      gapTimer = setTimeout(pump, PHRASE_GAP_MS);
+    });
+  }
+
+  function speak(d) {
+    var phrases = d.phrases || [];
+    if (d.interrupting) { stopSpeaking(); }
+    for (var i = 0; i < phrases.length; i++) { speaking.push(phrases[i]); }
+    if (!current && !gapTimer) { pump(); }
+  }
+
+  /**
+   * Warm the clips a workout opens with, so the very first "Get ready" isn't late while the
+   * TV fetches 38 KB over the internet. Everything else caches on first use.
+   */
+  function warmVoice(base) {
+    if (warmed || !base) return;
+    warmed = true;
+    var keys = ['getready', 'go', 'cd3', 'cd5', 'cd10', 'rest', 'n1', 'n2', 'n3'];
+    for (var i = 0; i < keys.length; i++) {
+      var a = new Audio(base + 'coach-jojo__' + keys[i] + '.mp3');
+      a.preload = 'auto';
+      try { a.load(); } catch (e) {}
+    }
+  }
+  function show(el, on) { el.className = on ? '' : 'hide'; }
+
+  function render(d) {
+    show($('idle'), false);
+    show($('content'), true);
+
+    var phase = String(d.phase || 'work').toLowerCase();
+    var c = PHASE[phase] || PHASE.work;
+    var rgb = 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+    // 18% of the phase colour over Jolt's ink, resolved to one opaque value.
+    var w = function (i, ink) { return Math.round(c[i] * 0.18 + ink * 0.82); };
+    $('stage').style.background =
+      'rgb(' + w(0, 10) + ',' + w(1, 14) + ',' + w(2, 20) + ')';
+    $('phase').style.color = rgb;
+
+    warmVoice(d.voiceBase);
+    $('phase').innerHTML = d.phaseTitle || '';
+    $('clock').innerHTML = d.clock || '0:00';
+
+    // 2*pi*44 = 276.5, matching the dasharray in the stylesheet.
+    var frac = Math.max(0, Math.min(1, Number(d.fraction) || 0));
+    $('arc').style.stroke = rgb;
+    $('arc').style.strokeDashoffset = String(276.5 * (1 - frac));
+    // Rest prints the clock in amber: the colour is the phase signal.
+    $('clock').style.color = (phase === 'rest') ? rgb : '#F3F6FB';
+
+    // A rest shows the *coming* round, so say so — otherwise it reads as instructions
+    // for the rest itself.
+    var isRest = (phase === 'rest');
+    show($('nextup'), isRest);
+
+    var moves = d.movements || [];
+    var holder = $('moves');
+    var old = holder.getElementsByClassName('move');
+    while (old.length) { holder.removeChild(old[0]); }
+    // Shrink as the list grows, the same rule gym mode uses on the phone: a long workout
+    // must fit rather than overflow across the title and the plan strip.
+    var rows = moves.length + (isRest ? 1 : 0);
+    var sizeV = Math.min(6, 40 / Math.max(1, rows * 1.32));
+    for (var i = 0; i < moves.length; i++) {
+      var row = document.createElement('div');
+      row.className = 'move';
+      row.style.fontSize = sizeV + 'vmin';
+      row.style.marginBottom = (sizeV * 0.22) + 'vmin';
+      row.innerHTML = (moves[i].reps ? '<b style="color:' + rgb + '">' + moves[i].reps + '</b>' : '') +
+                      String(moves[i].name).toUpperCase();
+      holder.appendChild(row);
+    }
+
+    // With no movements the ring takes the middle on its own rather than sitting off-centre.
+    var bare = !moves.length && !isRest;
+    show(holder, !bare);
+    $('middle').className = bare ? 'bare' : '';
+
+    var plan = d.plan || [];
+    var ph = '';
+    for (var k = 0; k < plan.length; k++) {
+      ph += '<div class="blk' + (plan[k].current ? ' on' : '') + '">' +
+            '<span class="r" style="color:' + (plan[k].current ? rgb : '#98A2B3') + '">' +
+            plan[k].label + '</span>' + plan[k].moves + '</div>';
+    }
+    $('plan').innerHTML = ph;
+
+    var stats = [];
+    if (d.round && d.totalRounds) stats.push(['ROUND', d.round + '/' + d.totalRounds]);
+    if (d.reps) stats.push(['REPS', d.reps]);
+    if (d.elapsed) stats.push(['ELAPSED', d.elapsed]);
+    if (d.remaining) stats.push(['LEFT', d.remaining]);
+    var html = '';
+    for (var j = 0; j < stats.length; j++) {
+      html += '<div class="stat"><div class="v">' + stats[j][1] + '</div>' +
+              '<div class="l">' + stats[j][0] + '</div></div>';
+    }
+    $('stats').innerHTML = html;
+  }
+
+  function finished(d) {
+    show($('content'), false);
+    show($('idle'), true);
+    $('idleText').innerHTML = (d.name ? d.name + ' — ' : '') + 'great work.';
+  }
+
+  try {
+    var ctx = cast.framework.CastReceiverContext.getInstance();
+    ctx.addCustomMessageListener('urn:x-cast:com.joltapp.jolt', function (event) {
+      var d = event.data;
+      if (typeof d === 'string') { d = JSON.parse(d); }
+      if (!d) return;
+      if (d.type === 'speak') { speak(d); return; }
+      if (d.type === 'silence') { stopSpeaking(); return; }
+      if (d.type === 'finished') { stopSpeaking(); finished(d); return; }
+      render(d);
+    });
+
+    // A gym timer must not vanish because nobody touched anything for five minutes.
+    var opts = new cast.framework.CastReceiverOptions();
+    opts.disableIdleTimeout = true;
+    opts.maxInactivity = 3600;
+    ctx.start(opts);
+  } catch (e) {
+    // Loaded outside a Cast device (a browser, for testing). The page still renders.
+    $('idleText').innerHTML = 'Receiver loaded — no Cast session (' + e.message + ')';
+  }
+</script>
+</body>
+</html>
